@@ -2,12 +2,17 @@
 //!
 //! The desktop finds the app that opens `myapp://` through a `.desktop`
 //! file with `MimeType=x-scheme-handler/myapp`, named after the app's id in
-//! `$XDG_DATA_HOME/applications`. The runner makes sure that entry opens the
-//! app's links and files, without taking over an entry someone else wrote:
+//! `$XDG_DATA_HOME/applications` or a system data directory. The runner makes
+//! sure that entry opens the app's links and files, without taking over an
+//! entry someone else wrote:
 //!
-//! - none there: it writes its own, which it marks as NSH's, and rewrites
-//!   whenever it differs (the executable may move, and a package unpacked
-//!   anywhere still opens its links);
+//! - none in the user directory, or one NSH wrote: it reuses the first
+//!   matching system entry, merging missing types and a URL field code while
+//!   keeping its other lines. If that entry already opens the types, an
+//!   NSH-written user entry is removed so it cannot shadow the installed one;
+//! - no matching system entry: it writes its own, which it marks as NSH's,
+//!   and rewrites whenever it differs (the executable may move, and a package
+//!   unpacked anywhere still opens its links);
 //! - one an installer or the user wrote whose `Exec` starts this executable
 //!   (by path, or by name on the `PATH`): the types it lacks are added to
 //!   its `MimeType`, and a URL field code to its `Exec` when it has none,
@@ -62,6 +67,20 @@ pub(crate) fn register(app_id: &str, name: &str, schemes: &[String], mime_types:
             return;
         }
     };
+    let current_is_nsh = current
+        .as_deref()
+        .is_some_and(|text| written_by_nsh(text, app_id));
+    let installed = if current.is_none() || current_is_nsh {
+        match installed_entry(&file) {
+            Ok(installed) => installed,
+            Err(e) => {
+                log::warn!("nsh: cannot read an installed desktop entry for {app_id}: {e}");
+                return;
+            }
+        }
+    } else {
+        None
+    };
     let args = EXEC_ARGS.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let types = Types::new(schemes, mime_types);
     let icon = exe
@@ -72,7 +91,14 @@ pub(crate) fn register(app_id: &str, name: &str, schemes: &[String], mime_types:
     let this = exe.canonicalize().unwrap_or_else(|_| exe.clone());
     let starts_this =
         |program: &str| resolve(program).is_some_and(|p| p.canonicalize().is_ok_and(|p| p == this));
-    let plan = plan(current.as_deref(), &ours, app_id, &types, starts_this);
+    let plan = plan(
+        current.as_deref(),
+        installed.as_deref(),
+        &ours,
+        app_id,
+        &types,
+        starts_this,
+    );
     if plan == Plan::Foreign {
         log::info!(
             "nsh: {} starts another copy of the app; leaving it as it is",
@@ -88,22 +114,24 @@ pub(crate) fn register(app_id: &str, name: &str, schemes: &[String], mime_types:
         .map(String::as_str)
         .filter(|kind| !handled(kind))
         .collect();
-    if let Plan::Write(text) = plan {
-        if let Err(e) = write_atomically(&dir, &path, &text) {
-            log::warn!("nsh: cannot register the app's URL schemes: {e}");
-            return;
-        }
-        // Where the directory has a MIME cache (`update-desktop-database`,
-        // which `xdg-mime` reads on desktops without GIO), it would miss
-        // the new types.
-        if dir.join("mimeinfo.cache").exists() {
-            let updated = std::process::Command::new("update-desktop-database")
-                .arg(&dir)
-                .status();
-            if !updated.is_ok_and(|s| s.success()) {
-                log::warn!("nsh: cannot update {}'s MIME cache", dir.display());
+    match plan {
+        Plan::Write(text) => {
+            if let Err(e) = write_atomically(&dir, &path, &text) {
+                log::warn!("nsh: cannot register the app's URL schemes: {e}");
+                return;
             }
+            update_mime_cache(&dir);
         }
+        Plan::Remove => {
+            if let Err(e) = std::fs::remove_file(&path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                log::warn!("nsh: cannot remove {}: {e}", path.display());
+                return;
+            }
+            update_mime_cache(&dir);
+        }
+        Plan::Current | Plan::Foreign => {}
     }
     for kind in unhandled {
         // xdg-utils' `xdg-mime` writes the default where this desktop reads
@@ -113,6 +141,28 @@ pub(crate) fn register(app_id: &str, name: &str, schemes: &[String], mime_types:
             .status();
         if !made.is_ok_and(|s| s.success()) {
             log::warn!("nsh: cannot make the app open {kind} (xdg-mime)");
+        }
+    }
+}
+
+/// The first system desktop entry with this name, as XDG searches it.
+fn installed_entry(file: &str) -> std::io::Result<Option<String>> {
+    for data_dir in glib::system_data_dirs() {
+        if let Some(text) = read(&data_dir.join("applications").join(file))? {
+            return Ok(Some(text));
+        }
+    }
+    Ok(None)
+}
+
+/// Refreshes a MIME cache when this desktop maintains one.
+fn update_mime_cache(dir: &Path) {
+    if dir.join("mimeinfo.cache").exists() {
+        let updated = std::process::Command::new("update-desktop-database")
+            .arg(dir)
+            .status();
+        if !updated.is_ok_and(|s| s.success()) {
+            log::warn!("nsh: cannot update {}'s MIME cache", dir.display());
         }
     }
 }
@@ -183,40 +233,48 @@ enum Plan {
     Current,
     /// This text opens them.
     Write(String),
+    /// An installed entry opens them, so a generated user entry must go.
+    Remove,
     /// It starts another executable: left alone.
     Foreign,
 }
 
-/// What the entry `current` (`None`: there is none) needs: NSH's own, `ours`,
-/// where there is none or NSH wrote it; else, when its `Exec` starts this
-/// executable (`starts_this` of its program), the missing `types` and a URL
-/// field code.
+/// What the entries need: preserve a user-written entry; otherwise reuse an
+/// installed entry that starts this executable, or NSH's own `ours`.
 fn plan(
     current: Option<&str>,
+    installed: Option<&str>,
     ours: &str,
     app_id: &str,
     types: &Types,
-    starts_this: impl Fn(&str) -> bool,
+    starts_program: impl Fn(&str) -> bool,
 ) -> Plan {
-    let Some(current) = current else {
-        return Plan::Write(ours.to_owned());
+    let current_is_nsh = current.is_some_and(|text| written_by_nsh(text, app_id));
+    let starts_this = |text: &str| {
+        value(text, "Exec")
+            .and_then(|exec| program(&exec))
+            .is_some_and(|program| starts_program(&program))
     };
-    if written_by_nsh(current, app_id) {
-        return if current == ours {
-            Plan::Current
-        } else {
-            Plan::Write(ours.to_owned())
+    if let Some(current) = current.filter(|_| !current_is_nsh) {
+        if !starts_this(current) {
+            return Plan::Foreign;
+        }
+        return match merge(current, types) {
+            Some(text) => Plan::Write(text),
+            None => Plan::Current,
         };
     }
-    if !value(current, "Exec")
-        .and_then(|exec| program(&exec))
-        .is_some_and(|program| starts_this(&program))
-    {
-        return Plan::Foreign;
+    if let Some(installed) = installed.filter(|text| starts_this(text)) {
+        return match merge(installed, types) {
+            Some(text) => Plan::Write(text),
+            None if current_is_nsh => Plan::Remove,
+            None => Plan::Current,
+        };
     }
-    match merge(current, types) {
-        Some(text) => Plan::Write(text),
-        None => Plan::Current,
+    if current_is_nsh && current == Some(ours) {
+        Plan::Current
+    } else {
+        Plan::Write(ours.to_owned())
     }
 }
 
@@ -505,8 +563,16 @@ mod tests {
     /// `plan` for the app `com.a.b`, whose executable is `/opt/b/b` (also
     /// found as `b` on the `PATH`).
     fn plan_for(current: Option<&str>, types: &Types) -> Plan {
+        plan_for_with_installed(current, None, types)
+    }
+
+    fn plan_for_with_installed(
+        current: Option<&str>,
+        installed: Option<&str>,
+        types: &Types,
+    ) -> Plan {
         let ours = entry("com.a.b", "B", Path::new("/opt/b/b"), &[], types, None);
-        plan(current, &ours, "com.a.b", types, |program| {
+        plan(current, installed, &ours, "com.a.b", types, |program| {
             program == "/opt/b/b" || program == "b"
         })
     }
@@ -607,6 +673,10 @@ mod tests {
     #[test]
     fn an_installed_entry_that_opens_the_types_is_left_as_it_is() {
         assert_eq!(
+            plan_for_with_installed(None, Some(INSTALLED), &types(&["b"], &[])),
+            Plan::Current
+        );
+        assert_eq!(
             plan_for(Some(INSTALLED), &types(&["b"], &[])),
             Plan::Current
         );
@@ -619,6 +689,66 @@ mod tests {
         assert_eq!(
             plan_for(Some(&absolute), &types(&["b"], &[])),
             Plan::Current
+        );
+    }
+
+    #[test]
+    fn an_installed_entry_that_covers_types_removes_a_stale_nsh_entry() {
+        let types = types(&["b"], &[]);
+        let stale = entry(
+            "com.a.b",
+            "B",
+            Path::new("/old/b"),
+            &["--app-id".to_owned()],
+            &types,
+            None,
+        );
+        assert!(written_by_nsh(&stale, "com.a.b"));
+        assert_eq!(
+            plan_for_with_installed(Some(&stale), Some(INSTALLED), &types),
+            Plan::Remove
+        );
+    }
+
+    #[test]
+    fn an_installed_entry_missing_types_is_merged() {
+        let types = types(&["b", "bb"], &["video/mp4"]);
+        let expected = INSTALLED.replace(
+            "MimeType=x-scheme-handler/b;\n",
+            "MimeType=x-scheme-handler/b;x-scheme-handler/bb;video/mp4;\n",
+        );
+        assert_eq!(
+            plan_for_with_installed(None, Some(INSTALLED), &types),
+            Plan::Write(expected)
+        );
+    }
+
+    #[test]
+    fn an_installed_entry_for_another_executable_does_not_change_the_fallback() {
+        let types = types(&["b", "bb"], &[]);
+        let foreign = INSTALLED.replace("Exec=b %u", "Exec=/elsewhere/b %u");
+        let ours = entry("com.a.b", "B", Path::new("/opt/b/b"), &[], &types, None);
+        assert_eq!(
+            plan_for_with_installed(None, Some(&foreign), &types),
+            Plan::Write(ours)
+        );
+    }
+
+    #[test]
+    fn a_user_written_entry_keeps_precedence_over_an_installed_entry() {
+        let types = types(&["b", "bb"], &[]);
+        let current = INSTALLED.replace("Name=B\n", "Name=User\n");
+        let installed = INSTALLED.replace("Name=B\n", "Name=Installed\n").replace(
+            "MimeType=x-scheme-handler/b;\n",
+            "MimeType=x-scheme-handler/b;x-scheme-handler/bb;\n",
+        );
+        let expected = current.replace(
+            "MimeType=x-scheme-handler/b;\n",
+            "MimeType=x-scheme-handler/b;x-scheme-handler/bb;\n",
+        );
+        assert_eq!(
+            plan_for_with_installed(Some(&current), Some(&installed), &types),
+            Plan::Write(expected)
         );
     }
 

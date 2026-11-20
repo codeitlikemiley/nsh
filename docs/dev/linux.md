@@ -137,6 +137,12 @@ server binds only to loopback and requires a non-empty token.
 | Networking | `nsh_engine::net` | ureq (rustls, webpki roots), one thread per request, streaming both ways; only connecting and the response head have deadlines |
 | Dev | `dev.rs` | The dev server client on its own thread; status line and error overlay above the surface; Ctrl+R reloads the latest build |
 
+For packaged apps, `links.rs` also checks system data directories in order
+when the user entry is missing or NSH-generated. It reuses the first entry
+whose `Exec` starts this executable, merges missing types, and removes a stale
+NSH user entry when the installed one already covers them. A user-written
+entry keeps precedence.
+
 ## File drop destinations
 
 Views listening to `onFileDrop` install a root `GtkDropTarget` for `GdkFileList`
